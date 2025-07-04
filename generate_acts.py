@@ -15,12 +15,10 @@ class Hook:
         self.out = None
 
     def __call__(self, module, module_inputs, module_outputs):
-        # store the primary output tensor (for attention, module_outputs may be tuple)
         if isinstance(module_outputs, tuple):
             self.out = module_outputs[0]
         else:
             self.out = module_outputs
-
 
 def load_model(model_family: str, model_size: str, model_type: str, device: str):
     model_path = os.path.join(
@@ -28,6 +26,7 @@ def load_model(model_family: str, model_size: str, model_type: str, device: str)
         config[model_family][f'{model_size}_{model_type}_subdir']
     )
     try:
+        # load tokenizer & model
         if model_family == 'Llama2':
             tokenizer = LlamaTokenizer.from_pretrained(str(model_path))
             model = LlamaForCausalLM.from_pretrained(str(model_path))
@@ -35,61 +34,72 @@ def load_model(model_family: str, model_size: str, model_type: str, device: str)
         else:
             tokenizer = AutoTokenizer.from_pretrained(str(model_path))
             model = AutoModelForCausalLM.from_pretrained(str(model_path))
-        if model_family == "Gemma2":
-            model = model.to(t.bfloat16)
+
+        # decide dtype based on family & device
+        if device == 'cpu':
+            dtype = t.float32
         else:
-            model = model.half()
-        return tokenizer, model.to(device)
+            # Fix: Only use bfloat16 if supported
+            if model_family.lower() == "gemma2" and t.cuda.is_available() and t.cuda.is_bf16_supported():
+                dtype = t.bfloat16
+            else:
+                dtype = t.float16
+
+        model = model.to(device=device, dtype=dtype)
+
+        # abstract layer container for hook registration
+        if hasattr(model.model, 'layers'):
+            model._custom_layers = model.model.layers
+        elif hasattr(model.model, 'transformer') and hasattr(model.model.transformer, 'layers'):
+            model._custom_layers = model.model.transformer.layers
+        else:
+            raise ValueError("Unknown transformer layer structure")
+
+        return tokenizer, model
     except Exception as e:
         print(f"Error loading model: {e}")
         raise
-
 
 def load_statements(dataset_name):
     dataset = pd.read_csv(f"datasets/{dataset_name}.csv")
     return dataset['statement'].tolist()
 
-
-def get_acts(statements, tokenizer, model, layers, device):
-    """
-    Extract attention and MLP activations for each real transformer layer.
-    Map each real layer l to pseudo-layer 2*l (attention) and 2*l+1 (mlp).
-    """
+def get_acts(statements, tokenizer, model, layers, device, model_family):
     attn_hooks = {}
     mlp_hooks = {}
     handles = []
 
-    # register hooks
     for l in layers:
         attn_hook = Hook()
         mlp_hook = Hook()
-        handles.append(model.model.layers[l].self_attn.register_forward_hook(attn_hook))
-        handles.append(model.model.layers[l].mlp.register_forward_hook(mlp_hook))
+        # switch attribute for Gemma families
+        layer_module = model._custom_layers[l]
+        if 'gemma' in model_family.lower():
+            handles.append(layer_module.self_attention.register_forward_hook(attn_hook))
+        else:
+            handles.append(layer_module.self_attn.register_forward_hook(attn_hook))
+        handles.append(layer_module.mlp.register_forward_hook(mlp_hook))
         attn_hooks[l] = attn_hook
         mlp_hooks[l] = mlp_hook
 
-    # prepare storage for pseudo-layers
     acts = {2 * l: [] for l in layers}
     acts.update({2 * l + 1: [] for l in layers})
 
-    # run forward and collect
     for statement in tqdm(statements):
-        input_ids = tokenizer.encode(statement, return_tensors="pt").to(device)
+        input_ids = tokenizer.encode(statement, return_tensors="pt", add_special_tokens=True).to(device)
         model(input_ids)
         for l in layers:
+            # grab last-token activation
             acts[2 * l].append(attn_hooks[l].out[0, -1])
             acts[2 * l + 1].append(mlp_hooks[l].out[0, -1])
 
-    # stack tensors
     for k in acts:
         acts[k] = t.stack(acts[k]).float()
 
-    # remove hooks
     for handle in handles:
         handle.remove()
 
     return acts
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate activations for statements in a dataset")
@@ -128,13 +138,13 @@ if __name__ == "__main__":
         statements = load_statements(dataset)
         layers = [int(x) for x in args.layers]
         if layers == [-1]:
-            layers = list(range(len(model.model.layers)))
+            layers = list(range(len(model._custom_layers)))
         save_dir = f"{args.output_dir}/{args.model_family}/{args.model_size}/{args.model_type}/{dataset}/"
         os.makedirs(save_dir, exist_ok=True)
 
         for idx in range(0, len(statements), 25):
             batch = statements[idx:idx + 25]
-            acts = get_acts(batch, tokenizer, model, layers, args.device)
+            acts = get_acts(batch, tokenizer, model, layers, args.device, args.model_family)
             for pseudo_layer, act in acts.items():
                 for i in range(act.size(0)):
                     t.save(act[i], f"{save_dir}/layer_{pseudo_layer}_{idx + i}.pt")
