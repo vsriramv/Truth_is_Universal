@@ -74,10 +74,7 @@ def get_acts(statements, tokenizer, model, layers, device, model_family):
         mlp_hook = Hook()
         # switch attribute for Gemma families
         layer_module = model._custom_layers[l]
-        if 'gemma' in model_family.lower():
-            handles.append(layer_module.self_attention.register_forward_hook(attn_hook))
-        else:
-            handles.append(layer_module.self_attn.register_forward_hook(attn_hook))
+        handles.append(layer_module.self_attn.register_forward_hook(attn_hook))
         handles.append(layer_module.mlp.register_forward_hook(mlp_hook))
         attn_hooks[l] = attn_hook
         mlp_hooks[l] = mlp_hook
