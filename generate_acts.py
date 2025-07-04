@@ -11,11 +11,12 @@ config = configparser.ConfigParser()
 config.read('config.ini')
 
 class Hook:
-    def __init__(self):
+    def __init__(self, name):
         self.out = None
+        self.name = name
 
     def __call__(self, module, module_inputs, module_outputs):
-        self.out, _ = module_outputs
+        self.out = module_outputs
 
 def load_model(model_family: str, model_size: str, model_type: str, device: str):
     model_path = os.path.join(config[model_family]['weights_directory'], 
@@ -29,12 +30,14 @@ def load_model(model_family: str, model_size: str, model_type: str, device: str)
         else:
             tokenizer = AutoTokenizer.from_pretrained(str(model_path))
             model = AutoModelForCausalLM.from_pretrained(str(model_path))
-        if model_family == "Gemma2": # Gemma2 requires bfloat16 precision which is only available on new GPUs
-            model = model.to(t.bfloat16) # Convert the model to bfloat16 precision
+        if model_family == "Gemma2":
+            #edit1 begins
+            model = model.to(t.bfloat16)
         else:
-            model = model.half()  # storing model in float32 precision -> conversion to float16
+            model = model.half()
+            #edit1 ends
         return tokenizer, model.to(device)
-    except Exception as e:
+    except Exception as e:   
         print(f"Error loading model: {e}")
         raise
 
@@ -46,35 +49,51 @@ def load_statements(dataset_name):
     statements = dataset['statement'].tolist()
     return statements
 
-def get_acts(statements, tokenizer, model, layers, device):
-    """
-    Get given layer activations for the statements. 
-    Return dictionary of stacked activations.
-    """
-    # attach hooks
-    hooks, handles = [], []
+def get_acts(statements, tokenizer, model, layers, device, save_dir, batch_offset):
+    hooks, handles = {}, []
+
     for layer in layers:
-        hook = Hook()
-        handle = model.model.layers[layer].register_forward_hook(hook)
-        hooks.append(hook), handles.append(handle)
-    
-    # get activations
-    acts = {layer : [] for layer in layers}
+        layer_module = model.model.layers[layer]
+
+        hook_attn = Hook(f"attn_{layer}")
+        handles.append(layer_module.self_attn.register_forward_hook(hook_attn))
+        hooks[f"attn_{layer}"] = hook_attn
+
+        if hasattr(layer_module, "mlp"):
+            hook_ffn = Hook(f"ffn_{layer}")
+            handles.append(layer_module.mlp.register_forward_hook(hook_ffn))
+            hooks[f"ffn_{layer}"] = hook_ffn
+        elif hasattr(layer_module, "post_attention"):
+            hook_ffn = Hook(f"ffn_{layer}")
+            handles.append(layer_module.post_attention.register_forward_hook(hook_ffn))
+            hooks[f"ffn_{layer}"] = hook_ffn
+        else:
+            raise ValueError(f"Cannot find MLP or post_attention in layer {layer}")
+
+    acts = {name: [] for name in hooks}
+
     for statement in tqdm(statements):
-        input_ids = tokenizer.encode(statement, return_tensors="pt").to(device)
+        input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
         model(input_ids)
-        for layer, hook in zip(layers, hooks):
-            acts[layer].append(hook.out[0, -1])
+
+        for name, hook in hooks.items():
+            acts[name].append(hook.out[0][-1])
+
+    for name, tensors in acts.items():
+        layer_type, block_id = name.split("_")
+        block_id = int(block_id)
+        file_layer_idx = 2 * block_id if layer_type == "attn" else 2 * block_id + 1
     
-    for layer, act in acts.items():
-        acts[layer] = t.stack(act).float()
-    
-    # remove hooks
+        # Fix: Ensure tensors are stacked consistently by taking only the last token
+        stacked = t.stack([x[-1] for x in tensors]).float()
+
+        file_path = os.path.join(save_dir, f"layer_{file_layer_idx}_{batch_offset}.pt")
+        t.save(stacked, file_path)
+
+
     for handle in handles:
         handle.remove()
-    
-    return acts
-
+        
 if __name__ == "__main__":
     """
     read statements from dataset, record activations in given layers, and save to specified files
@@ -120,6 +139,12 @@ if __name__ == "__main__":
             os.makedirs(save_dir)
 
         for idx in range(0, len(statements), 25):
-            acts = get_acts(statements[idx:idx + 25], tokenizer, model, layers, args.device)
-            for layer, act in acts.items():
-                    t.save(act, f"{save_dir}/layer_{layer}_{idx}.pt")
+            get_acts(
+                statements=statements[idx:idx + 25],
+                tokenizer=tokenizer,
+                model=model,
+                layers=layers,
+                device=args.device,
+                save_dir=save_dir,
+                batch_offset=idx
+            )
